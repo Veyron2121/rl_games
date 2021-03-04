@@ -271,3 +271,40 @@ class ModelSACContinuous(BaseModel):
 
 
 
+
+class ModelCLearningContinuous(BaseModel):
+    def __init__(self, network):
+        BaseModel.__init__(self)
+        self.network_builder = network
+
+    def build(self, config):
+        net = self.network_builder.build('clearning', **config)
+        for name, _ in net.named_parameters():
+            print(name)
+        return ModelCLearningContinuous.Network(net)
+
+    class Network(nn.Module):
+        def __init__(self, clearning_network):
+            nn.Module.__init__(self)
+            self.clearning_network = clearning_network
+            
+        def actor(self, x):
+            return self.clearning_network.actor(x)
+        
+        def critic1(self, x):
+            return self.clearning_network.critic1(x)
+
+        def critic2(self, x):
+            return self.clearning_network.critic2(x)
+
+        def target_actor(self, x):
+            return self.clearning_network.target_actor(x)
+        
+        def target_critic1(self, x):
+            return self.clearning_network.target_critic1(x)
+
+        def target_critic2(self, x):
+            return self.clearning_network.target_critic2(x)
+
+        def forward(self, input_dict):
+            pass

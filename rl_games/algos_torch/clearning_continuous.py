@@ -1,0 +1,641 @@
+from rl_games.common import a2c_common
+from rl_games.algos_torch import torch_ext
+
+from rl_games.algos_torch.running_mean_std import RunningMeanStd
+from rl_games.algos_torch import central_value, rnd_curiosity
+from rl_games.common import vecenv
+from rl_games.common import common_losses
+from rl_games.common import datasets
+from rl_games.common import schedulers
+from rl_games.common import experience
+
+from tensorboardX import SummaryWriter
+from datetime import datetime
+
+from torch import optim
+import torch 
+from torch import nn
+import torch.nn.functional as F
+import numpy as np
+import time
+# TODO: Change all self.env to self.vec_env
+
+class normalizer:
+    def __init__(self, size, eps=1e-2, default_clip_range=np.inf):
+        self.size = size
+        self.eps = eps
+        self.default_clip_range = default_clip_range
+        # some local information
+        self.local_sum = np.zeros(self.size, np.float32)
+        self.local_sumsq = np.zeros(self.size, np.float32)
+        self.local_count = np.zeros(1, np.float32)
+        # get the total sum sumsq and sum count
+        self.total_sum = np.zeros(self.size, np.float32)
+        self.total_sumsq = np.zeros(self.size, np.float32)
+        self.total_count = np.ones(1, np.float32)
+        # get the mean and std
+        self.mean = np.zeros(self.size, np.float32)
+        self.std = np.ones(self.size, np.float32)
+        # thread locker
+        self.lock = threading.Lock()
+
+    # update the parameters of the normalizer
+    def update(self, v):
+        v = v.reshape(-1, self.size)
+        # do the computing
+        with self.lock:
+            self.local_sum += v.sum(axis=0)
+            self.local_sumsq += (np.square(v)).sum(axis=0)
+            self.local_count[0] += v.shape[0]
+
+    # sync the parameters across the cpus
+    def sync(self, local_sum, local_sumsq, local_count):
+        local_sum[...] = self._mpi_average(local_sum)
+        local_sumsq[...] = self._mpi_average(local_sumsq)
+        local_count[...] = self._mpi_average(local_count)
+        return local_sum, local_sumsq, local_count
+
+    def recompute_stats(self):
+        with self.lock:
+            local_count = self.local_count.copy()
+            local_sum = self.local_sum.copy()
+            local_sumsq = self.local_sumsq.copy()
+            # reset
+            self.local_count[...] = 0
+            self.local_sum[...] = 0
+            self.local_sumsq[...] = 0
+        # synrc the stats
+        sync_sum, sync_sumsq, sync_count = self.sync(local_sum, local_sumsq, local_count)
+        # update the total stuff
+        self.total_sum += sync_sum
+        self.total_sumsq += sync_sumsq
+        self.total_count += sync_count
+        # calculate the new mean and std
+        self.mean = self.total_sum / self.total_count
+        self.std = np.sqrt(np.maximum(np.square(self.eps), (self.total_sumsq / self.total_count) - np.square(
+            self.total_sum / self.total_count)))
+
+    # average across the cpu's data
+    def _mpi_average(self, x):
+        buf = np.zeros_like(x)
+        MPI.COMM_WORLD.Allreduce(x, buf, op=MPI.SUM)
+        buf /= MPI.COMM_WORLD.Get_size()
+        return buf
+
+    # normalize the observation
+    def normalize(self, v, clip_range=None):
+        if clip_range is None:
+            clip_range = self.default_clip_range
+        return np.clip((v - self.mean) / (self.std), -clip_range, clip_range)
+
+class ClearningAgent:
+    def __init__(self, base_name, config):
+        print(config)
+        self.base_init(base_name, config)
+
+        self.critic_learning_rate = config['critic_learning_rate']
+        self.actor_learning_rate = config['actor_learning_rate']
+        self.seed = config['overall_seed']
+        
+        self.random_exploration_eps = config['random_exploration_eps']
+        self.max_ep_len = config['max_ep_len']
+        self.goal_directed_eps = config['goal_directed_eps']
+        self.exploration_epsilon = config['exploration_eps']
+        self.noise_epsilon = config['noise_eps']
+
+        self.eval_freq = config['eval_freq']
+
+        self.num_eval_goals = config['num_eval_goals']
+        self.train_steps_per_ep = config['train_steps_per_ep']
+        self.batch_size = config['batch_size']
+
+        # TODO: Might not be needed
+        action_space = self.env_info['action_space']
+        self.actions_num = action_space.shape[0]
+
+        self.training_loss = nn.BCELoss()
+
+        self.action_range = [
+            float(self.env_info['action_space'].low.min()),
+            float(self.env_info['action_space'].high.max())
+        ]
+
+        obs_shape = torch_ext.shape_whc_to_cwh(self.obs_shape) # TODO: Necessary?
+        config = {
+            'obs_dim': self.env_info["observation_space"].shape[0],
+            'action_dim': self.env_info["action_space"].shape[0],
+            'actions_num' : self.actions_num,
+            'input_shape' : obs_shape
+            # 'num_seqs' : self.num_actors * self.num_agents
+        } 
+        self.model = self.network.build(config)
+        self.model.to(self.device) # TODO: Get device
+        # print(self.model)
+        print("Number of Agents", self.num_actors, "Batch Size", self.batch_size)
+
+        self.optimizer_critic1 = torch.optim.Adam(self.model.clearning_network.critic1.parameters(), lr=self.learning_rate_critic)
+        self.optimizer_critic2 = torch.optim.Adam(self.model.clearning_network.critic2.parameters(), lr=self.learning_rate_critic)
+        self.optimizer_actor = torch.optim.Adam(self.model.clearning_network.actor.parameters(), lr=self.learning_rate_actor)
+
+        self.o_norm = normalizer(size=self.env_info["observation_space"].shape[0], default_clip_range=5) # TODO
+        self.g_norm = normalizer(size=env.d_goal, default_clip_range=5) # TODO
+        # TODO: Algo_Observer?
+        self.dataset = []
+        self.eval_goal_list = []
+        self.eval_mean_success = []
+        self.eval_mean_step = []
+        self.eval_pts = []
+        self.env_steps = []
+        self.total_steps_taken = 0
+        self.train_step_count = 0
+
+        self.batch_sampling_rng = np.random.RandomState(self.seed + 1)
+        self.exploration_rng = np.random.RandomState(self.seed + 2)
+
+    def base_init(self, base_name, config):
+        self.config = config
+        self.env_config = config.get('env_config', {})
+        self.num_actors = config['num_actors']
+        self.env_name = config['env_name']
+        print("Env name:", self.env_name)
+
+        self.env_info = config.get('env_info')
+        if self.env_info is None:
+            self.vec_env = vecenv.create_vec_env(self.env_name, self.num_actors, **self.env_config)
+            self.env_info = self.vec_env.get_env_info()
+
+        self.device = config.get('device', 'cuda:0')
+        print('Env info:')
+        print(self.env_info)
+
+        self.observation_space = self.env_info['observation_space']
+        self.action_space = self.env_info['action_space']
+        self.weight_decay = config.get('weight_decay', 0.0)
+        self.is_train = config.get('is_train', True)
+
+        self.save_freq = config.get('save_frequency', 0)
+        self.save_best_after = config.get('save_best_after', 100)
+        self.print_stats = config.get('print_stats', True)
+        # self.rnn_states = None
+        self.name = base_name
+
+        # self.ppo = config['ppo']
+        self.max_epochs = self.config.get('max_epochs', 1e6)
+        self.network = config['network']
+        self.rewards_shaper = config['reward_shaper']
+        self.num_agents = self.env_info.get('agents', 1)
+        self.steps_num = config['steps_num']
+        self.seq_len = self.config.get('seq_length', 4)
+        # self.normalize_advantage = config['normalize_advantage']
+        self.normalize_input = self.config['normalize_input']
+        # self.normalize_reward = self.config.get('normalize_reward', False)
+
+        self.obs_shape = self.observation_space.shape
+
+
+        self.games_to_track = self.config.get('games_to_track', 100)
+        self.game_rewards = torch_ext.AverageMeter(1, self.games_to_track).to(self.device)
+        self.game_lengths = torch_ext.AverageMeter(1, self.games_to_track).to(self.device)
+        self.obs = None
+        self.games_num = self.config['minibatch_size'] // self.seq_len # it is used only for current rnn implementation
+        self.batch_size = self.steps_num * self.num_actors * self.num_agents
+        print(self.batch_size, self.steps_num, self.num_actors, self.num_agents)
+        self.batch_size_envs = self.steps_num * self.num_actors
+        self.minibatch_size = self.config['minibatch_size']
+        self.mini_epochs_num = self.config['mini_epochs']
+        self.num_minibatches = self.batch_size // self.minibatch_size
+        assert(self.batch_size % self.minibatch_size == 0)
+
+        # self.last_lr = self.config['learning_rate']
+        self.frame = 0
+        self.update_time = 0
+        self.last_mean_rewards = -100500
+        self.play_time = 0
+        self.epoch_num = 0
+        
+        # self.entropy_coef = self.config['entropy_coef']
+        self.writer = SummaryWriter('runs/' + config['name'] + datetime.now().strftime("_%d-%H-%M-%S"))
+        print("Run Directory:", config['name'] + datetime.now().strftime("_%d-%H-%M-%S"))
+
+        self.is_tensor_obses = False
+        self.is_rnn = False
+        self.last_rnn_indices = None
+        self.last_state_indices = None
+
+    def init_tensors(self):
+        if self.observation_space.dtype == np.uint8:
+            torch_dtype = torch.uint8
+        else:
+            torch_dtype = torch.float32
+        batch_size = self.num_agents * self.num_actors
+
+        self.current_rewards = torch.zeros(batch_size, dtype=torch.float32, device=self.device)
+        self.current_lengths = torch.zeros(batch_size, dtype=torch.float32, device=self.device)
+        self.dones = torch.zeros((batch_size,), dtype=torch.uint8, device=self.device)
+        self.mb_obs = torch.zeros((self.steps_num, batch_size) + self.obs_shape, dtype=torch_dtype, device=self.device)
+
+        if self.has_central_value:
+            self.mb_vobs = torch.zeros((self.steps_num, self.num_actors) + self.state_shape, dtype=torch_dtype, device=self.device)
+
+        self.mb_rewards = torch.zeros((self.steps_num, batch_size), dtype = torch.float32, device=self.device)
+        self.mb_values = torch.zeros((self.steps_num, batch_size), dtype = torch.float32, device=self.device)
+        self.mb_dones = torch.zeros((self.steps_num, batch_size), dtype = torch.uint8, device=self.device)
+        self.mb_neglogpacs = torch.zeros((self.steps_num, batch_size), dtype = torch.float32, device=self.device)
+
+        if self.is_rnn:
+            self.rnn_states = self.model.get_default_rnn_state()
+            self.rnn_states = [s.to(self.device) for s in self.rnn_states]
+
+            batch_size = self.num_agents * self.num_actors
+            num_seqs = self.steps_num * batch_size // self.seq_len
+            assert((self.steps_num * batch_size // self.num_minibatches) % self.seq_len == 0)
+            self.mb_rnn_states = [torch.zeros((s.size()[0], num_seqs, s.size()[2]), dtype = torch.float32, device=self.device) for s in self.rnn_states]
+
+    @property
+    def alpha(self):
+        return self.log_alpha.exp()
+
+    
+    def get_full_state_weights(self):
+        state = self.get_weights()
+
+        state['steps'] = self.step #TODO
+        state['optimizer_actor'] = self.optimizer_actor.state_dict()
+        state['optimizer_critic1'] = self.optimizer_critic1.state_dict()
+        state['optimizer_critic2'] = self.optimizer_critic2.state_dict()       
+
+        if self.has_central_value:
+            state['assymetric_vf_nets'] = self.central_value_net.state_dict()
+        if self.has_curiosity:
+            state['rnd_nets'] = self.rnd_curiosity.state_dict()
+        return state
+
+    def get_weights(self):
+        state = {'actor': self.model.clearning_network.actor.state_dict(),
+         'target_actor' : self.model.clearning_network.target_actor.state_dict(),
+         'critic1': self.model.clearning_network.critic1.state_dict(), 
+         'target_critic1': self.model.clearning_network.target_critic1.state_dict(),
+         'critic2': self.model.clearning_network.critic2.state_dict(), 
+         'target_critic2': self.model.clearning_network.target_critic2.state_dict()}
+
+        if self.normalize_input:
+            state['running_mean_std'] = self.running_mean_std.state_dict()
+        # if self.normalize_reward:
+        #     state['reward_mean_std'] = self.reward_mean_std.state_dict()   
+        return state
+
+           
+
+        if self.has_central_value:
+            state['assymetric_vf_nets'] = self.central_value_net.state_dict()
+        if self.has_curiosity:
+            state['rnd_nets'] = self.rnd_curiosity.state_dict()
+        return state
+        
+    def save(self, fn):
+        state = self.get_full_state_weights()
+        torch_ext.save_scheckpoint(fn, state)
+
+    def set_weights(self, weights):
+        self.model.clearning_network.actor.load_state_dict(weights['actor'])
+        self.model.clearning_network.target_actor.load_state_dict(weights['target_actor'])
+
+        self.model.clearning_network.critic1.load_state_dict(weights['critic1'])
+        self.model.clearning_network.target_critic1.load_state_dict(weights['target_critic1'])
+
+        self.model.clearning_network.critic2.load_state_dict(weights['critic2'])
+        self.model.clearning_network.target_critic2.load_state_dict(weights['target_critic2'])
+
+        if self.normalize_input:
+            self.running_mean_std.load_state_dict(weights['running_mean_std'])
+        # if self.normalize_reward:
+        #     self.reward_mean_std.load_state_dict(weights['reward_mean_std'])
+
+    def set_full_state_weights(self, weights):
+        self.set_weights(weights)
+
+        self.step = weights['step']
+        if self.has_central_value:
+            self.central_value_net.load_state_dict(weights['assymetric_vf_nets'])
+        if self.has_curiosity:
+            self.rnd_curiosity.load_state_dict(weights['rnd_nets'])
+
+        self.optimizer_actor.load_state_dict(weights['optimizer_actor'])
+        self.optimizer_critic1.load_state_dict(weights['optimizer_critic1'])
+        self.optimizer_critic2.load_state_dict(weights['optimizer_critic2'])
+
+    def restore(self, fn):
+        checkpoint = torch_ext.load_checkpoint(fn)
+        self.set_full_state_weights(checkpoint)
+
+
+    def preproc_og(self, o):
+        o = np.clip(o, -200, 200)
+        return o
+
+    # update parameters in the o_norm normalizer
+    def update_o_norm(self, o_norm, episode):
+        input = []
+        ep_steps = len(episode)
+        for i in range(ep_steps):
+            input.append(np.array(episode[i]["observation"].copy()).squeeze())
+
+        input = preproc_og(np.array(input))
+        o_norm.update(input)
+        o_norm.recompute_stats()
+
+    # update parameters in the g_norm normalizer
+    def update_g_norm(self, env, g_norm):
+        generated_goals = []
+        for _ in range(10000):
+            obs = env.reset()
+            generated_goals.append(obs['desired_goal'].copy())
+        generated_goals_clip = preproc_og(np.array(generated_goals))
+        g_norm.update(generated_goals_clip)
+        g_norm.recompute_stats()
+        
+    def run_episode(self, action_policy, ep_length):
+        observation = self.vec_env.reset() # TODO
+        ep_history = []
+        success = 0
+        for _ in range(ep_length):
+            selected_actions = action_policy(observation['observation'], observation['desired_goal'])
+            new_observation, reward, done, _ = self.vec_env.step(selected_actions) # TODO
+            # Store transition in episode buffer
+            # Extend it out 
+            # Maybe make ep_history another (num_actors, *everything else) array
+            for i in range(self.num_actors):
+                ep_history.append({"observation": observation[i]['observation'].copy(),
+                                "action": selected_actions[i].copy(),
+                                "observation_next": new_observation[i]['observation'].copy(),
+                                "achieved_goal": new_observation[i]['achieved_goal'].copy(),
+                                "desired_goal":new_observation[i]['desired_goal'].copy()})
+            observation = new_observation
+            # TODO: figure out how this works
+            if reward > -0.5:
+                success = 1
+                break
+            if done:
+                break
+
+        return np.array(ep_history), success
+
+    def goal_conditioned_c_learning_policy(self, rng, exploration_epsilon=0.2, eval=False,
+                                           horizon=None, noise_epsilon=0.2, g_norm=None, o_norm=None):
+
+        max_horizon = horizon if horizon is not None else 50
+        horizon_vals = np.array([i + 1 for i in range(max_horizon)]).reshape((-1, 1))
+
+        def policy(state, goal):
+
+            state = o_norm.normalize(state)
+            goal = g_norm.normalize(goal)
+
+            tiled_state = np.tile(state, max_horizon).reshape((max_horizon, -1))
+            tiled_goal = np.tile(goal, reps=max_horizon).reshape((max_horizon, -1))
+
+            x_action = torch.cat(
+                (torch.tensor(tiled_state).float(), torch.tensor(tiled_goal).float(),
+                 torch.tensor(horizon_vals).float()),
+                dim=1).to(self.device)
+
+            exploration_p = rng.uniform(low=0.0, high=1.0)
+
+            if exploration_p < exploration_epsilon and not eval:
+                a = rng.uniform(-1, 1, size=self.action_space[0])
+            else:
+                actions = self.model.actor(x_action)
+                if eval:
+                    action_noise = actions
+                else:
+                    n = noise_epsilon * np.random.randn(self.self.action_space[0])
+                    tiled_noise = np.tile(n, max_horizon).reshape((max_horizon, -1))
+                    tiled_noise = torch.tensor(tiled_noise).float().to(self.device)
+                    action_noise = actions + tiled_noise
+                    action_noise = torch.clamp(action_noise, self.action_range[0], self.action_range[1]) # Can probably be done with * unzipping
+
+                x = torch.cat((x_action, torch.tensor(action_noise).float()), dim=1)
+                accessibilities = self.model.critic1(x).detach().cpu().numpy()
+                max_accessibility = accessibilities.max()
+                filter_level = 0.9 * max_accessibility
+                attainable_horizons = (accessibilities >= filter_level).any(axis=1)
+                # argmax only extracts 'True' values, and always returns the first.
+                min_attainable_horizon = attainable_horizons.argmax()
+                a = action_noise[min_attainable_horizon].detach().cpu().numpy()
+            return a
+
+        return policy
+
+    def sample_long_range_transitions(self, dataset: List, batch_size, rng: np.random.RandomState, env,
+                                  horizon_sampling_probs: np.array = None, use_HER= True, her_fraction=0.8):
+
+
+        prob = (np.arange(len(dataset)) + 1)
+
+        ep_idx_sample = rng.choice(len(dataset), size=batch_size, replace=True, p=prob / np.sum(prob))
+        ep_sample = [dataset[idx] for idx in ep_idx_sample]
+
+        start_idx_sample = [
+            rng.choice(len(ep)) for ep
+            in ep_sample]
+
+        if horizon_sampling_probs is None:
+            h_sample = np.array([rng.choice(len(ep) - start_idx) + 1 for ep, start_idx in zip(ep_sample, start_idx_sample)])
+        else:
+
+            max_h = len(horizon_sampling_probs)
+            h_sample = np.array([rng.choice(max_h, p=horizon_sampling_probs / horizon_sampling_probs.sum(), size=batch_size)+ 1])
+
+        states_sample = np.array([ep[start_idx]["observation"] for ep, start_idx in zip(ep_sample, start_idx_sample)])
+        actions_sample = np.array([ep[start_idx]["action"] for ep, start_idx in zip(ep_sample, start_idx_sample)])
+        states_prime_sample = np.array([ep[start_idx]["observation_next"] for ep, start_idx in zip(ep_sample, start_idx_sample)])
+        goals_achieved_sample = np.array([ep[start_idx]["achieved_goal"] for ep, start_idx in zip(ep_sample, start_idx_sample)])
+
+        if use_HER:
+            goals_achieved_idx_sample = [rng.choice(range(start, len(ep))) for ep, start in zip(ep_sample, start_idx_sample)]
+            goals_achieved = np.array([ep[end_idx]["achieved_goal"] for ep, end_idx in zip(ep_sample, goals_achieved_idx_sample)])
+            goals_desired = np.array([ep[0]["desired_goal"] for ep in ep_sample])
+
+            s = rng.choice([0, 1], p=[her_fraction, 1 - her_fraction], size=batch_size)
+            goals_sample = np.array([g1 if s1 == 0 else g2 for g1, g2, s1 in zip(goals_achieved, goals_desired, s)])
+        else:
+            end_idx_sample = []
+            for i in range(batch_size):
+                end_s = env.sample_goal_from_state(states_sample[i,:], h_sample[0][i], rng)
+                end_idx_sample.append(end_s)
+
+            goals_sample = np.array(end_idx_sample)
+
+        return states_sample, actions_sample, goals_sample, h_sample, states_prime_sample, goals_achieved_sample
+    
+    def learn(self, gde_ep, dataset, batch_size, batch_sampling_rng, o_norm, g_norm):
+        # Sample shorter transitions towards the start of training and high transition towards the end
+        horizon_sampling_probs = (np.arange(50) + 1) ** -(
+                    self.horizon_sampling_const * (1.0 - gde_ep / self.goal_directed_eps))
+
+        # sample minibatch
+        states_sample, actions_sample, goals_sample, horizons_sample, s_prime_sample, goal_achieved_sample = \
+            sample_long_range_transitions(dataset, batch_size=self.batch_size, rng=self.batch_sampling_rng,
+                                          horizon_sampling_probs=horizon_sampling_probs, env =self.vec_env,
+                                          her_fraction=self.HER_fraction, use_HER=self.use_HER)
+
+        if self.train_step_count % self.target_network_copy_freq == 0:
+            self.model.clearning_network.update_targets()
+
+        # save the unnormalized goals
+        goals_sample_unnormalized = goals_sample.copy()
+
+        # normalize data
+        states_sample = self.preproc_og(states_sample)
+        goals_sample = self.preproc_og(goals_sample)
+        s_prime_sample = self.preproc_og(s_prime_sample)
+        states_sample = self.o_norm.normalize(states_sample)
+        goals_sample = self.g_norm.normalize(goals_sample)
+        s_prime_sample = self.o_norm.normalize(s_prime_sample)
+
+        # critic loss
+        horizons_sample = horizons_sample.reshape((-1, 1))
+        x_lhs = torch.cat((torch.tensor(states_sample).float(), torch.tensor(goals_sample).float(),
+                           torch.tensor(horizons_sample).float(), torch.tensor(actions_sample).float()),
+                          dim=1).to(self.device)
+
+        accessibilities_lhs1 = self.model.critic1(x_lhs)
+        accessibilities_lhs2 = self.model.critic2(x_lhs)
+
+        with torch.no_grad():
+            x_rhs = torch.cat((torch.tensor(s_prime_sample).float(), torch.tensor(goals_sample).float(),
+                               torch.tensor(horizons_sample - 1).float()),
+                              dim=1).to(self.device)
+            action_target = self.model.target_actor(x_rhs).detach().cpu()
+
+            x_rhs2 = torch.cat((torch.tensor(s_prime_sample).float(), torch.tensor(goals_sample).float(),
+                                torch.tensor(horizons_sample - 1).float(), action_target.float()),
+                               dim=1).to(self.device)
+            accessibilities_rhs1 = self.model.target_critic1(x_rhs2).detach()
+            accessibilities_rhs2 = self.model.target_critic2(x_rhs2).detach()
+            accessibilities_rhs = torch.min(accessibilities_rhs1, accessibilities_rhs2)
+
+        # when h=1 or s_prim =g we are having a different target.
+        for i in range(len(horizons_sample)):
+            # TODO: Environment compute reward
+            if self.env.compute_reward(goal_achieved_sample[i], goals_sample_unnormalized[i], None) > -0.5:
+                accessibilities_rhs[i] = 1.0
+
+            if horizons_sample[i] == 1:
+                if self.env.compute_reward(goal_achieved_sample[i], goals_sample_unnormalized[i], None) > -0.5:
+                    accessibilities_rhs[i] = 1.0
+                else:
+                    accessibilities_rhs[i] = 0.0
+
+        self.optimizer_critic1.zero_grad()
+        loss_this_batch1 = self.training_loss(accessibilities_lhs1, accessibilities_rhs)
+        loss_this_batch1.backward()
+        self.optimizer_critic1.step()
+
+        self.optimizer_critic2.zero_grad()
+        loss_this_batch2 = self.training_loss(accessibilities_lhs2, accessibilities_rhs)
+        loss_this_batch2.backward()
+        self.optimizer_critic2.step()
+
+        # actor_loss
+        if self.train_step_count % self.policy_freq == 0:
+            x_a = torch.cat((torch.tensor(states_sample).float(), torch.tensor(goals_sample).float(),
+                             torch.tensor(horizons_sample).float()),
+                            dim=1).to(self.device)
+            actions_actor = self.model.actor(x_a).cpu()
+
+            x_a2 = torch.cat((torch.tensor(states_sample).float(), torch.tensor(goals_sample).float(),
+                              torch.tensor(horizons_sample).float(), actions_actor.float()),
+                             dim=1).to(self.device)
+            loss = -torch.mean(self.model.critic1(x_a2))
+
+            self.optimizer_actor.zero_grad()
+            loss.backward()
+            self.optimizer_actor.step()
+
+        self.train_step_count += 1
+    
+
+    def train(self):
+        start_time_s = time()
+        self.init_tensors()
+        def random_exploration_policy(states, goal):
+            return np.random.uniform(low=self.action_range[0], high=self.action_range[1], size=self.env_info["action_space"].shape)
+
+        for _ in range(self.random_exploration_eps):
+            ep_history, ep_success = self.run_episode(action_policy=random_exploration_policy,
+                                            ep_length=self.max_ep_len)
+            total_steps_taken += len(ep_history)
+
+            # add episode to the dataset when the length is larger than 1
+            if len(ep_history) > 1:
+                dataset.append(ep_history)
+
+        gde_start_time_s = time()
+
+        for gde_ep in range(self.goal_directed_eps):
+
+            policy = self.goal_conditioned_c_learning_policy(rng=self.exploration_rng,
+                                                        eval=False, exploration_epsilon=self.exploration_epsilon,
+                                                        noise_epsilon=self.noise_epsilon, g_norm=self.g_norm, o_norm=self.o_norm)
+
+            ep_history, ep_success = self.run_episode(action_policy=policy,
+                                                ep_length=self.max_ep_len)
+
+            # update statistics for o norm using the collected episode
+            update_o_norm(o_norm=self.o_norm, episode=ep_history)
+
+            # add episode to the dataset when the length is larger than 1
+
+            # TODO: Redundant. Is appending needed, or extending? Maybe I should keep a vector of stuff and unflatten it here
+            if len(ep_history) > 1:
+                dataset.append(ep_history)
+
+            # calc total steps taken
+            total_steps_taken += len(ep_history)
+            env_steps.append(total_steps_taken)
+
+            # evaluation step
+            if gde_ep % self.eval_freq == 0:
+
+                eval_goal_step = []
+                eval_goal_success = []
+                goal_list = []
+                for _ in range(self.num_eval_goals):
+                    policy = self.goal_conditioned_c_learning_policy(rng=self.exploration_rng,
+                                                                                        eval=True,
+                                                                                        exploration_epsilon=self.exploration_epsilon,
+                                                                                        noise_epsilon=self.noise_epsislon,
+                                                                                        g_norm=self.g_norm, o_norm=self.o_norm)
+
+                    ep_history, ep_success = self.run_episode(action_policy=policy,
+                                                                            ep_length=self.max_ep_len)
+
+                    eval_goal_step.append(len(ep_history))
+                    eval_goal_success.append(ep_success)
+
+                gde_elapsed_time_s = time() - gde_start_time_s
+                gde_mean_ep_time = gde_elapsed_time_s / (
+                            (gde_ep + 1) + (gde_ep // self.eval_freq + 1) * (1 + self.num_eval_goals))
+
+                # print and save the result for the eval
+                print(
+                    f'Mean success rate to goal: {np.mean(eval_goal_success):.2f}\tMean step to goal: {np.mean(eval_goal_step):.1f} ' +
+                    f' [episode {gde_ep} / {self.goal_directed_eps}, {gde_mean_ep_time:.2f} s per episode]')
+
+                eval_goal_list.append(np.array(goal_list))
+                eval_mean_success.append(np.mean(eval_goal_success))
+                eval_mean_step.append(np.mean(eval_goal_step))
+                eval_pts.append(gde_ep)
+
+            #train the models
+            for _ in range(self.train_steps_per_ep):
+                # sample a mini-batch of training
+                batch_size = self.batch_size
+                self.learn(gde_ep, dataset, batch_size=batch_size, batch_sampling_rng=self.batch_sampling_rng, o_norm=self.o_norm, g_norm=self.g_norm)
+
+        elapsed_time_s = time() - start_time_s
+        print('Training took {:.0f} seconds.'.format(elapsed_time_s))
+
+
+        
