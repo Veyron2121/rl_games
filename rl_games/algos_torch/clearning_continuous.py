@@ -359,7 +359,9 @@ class ClearningAgent:
         ep_history = []
         success = 0
         for _ in range(ep_length):
-            selected_actions = action_policy(observation['observation'], observation['desired_goal'])
+            selected_actions = torch.empty(self.num_actors, *self.env_info["action_space"].shape).to(self.device)
+            for i in range(self.num_actors):
+                selected_actions[i]  = action_policy(observation['observation'], observation['desired_goal'])
             new_observation, reward, done, _ = self.vec_env.step(selected_actions) # TODO
             # Store transition in episode buffer
             # Extend it out 
