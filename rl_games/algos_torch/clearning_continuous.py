@@ -2,7 +2,7 @@ from rl_games.common import a2c_common
 from rl_games.algos_torch import torch_ext
 
 from rl_games.algos_torch.running_mean_std import RunningMeanStd
-from rl_games.algos_torch import central_value, rnd_curiosity
+# from rl_games.algos_torch import central_value, rnd_curiosity
 from rl_games.common import vecenv
 from rl_games.common import common_losses
 from rl_games.common import datasets
@@ -92,9 +92,38 @@ class ClearningAgent:
     def __init__(self, base_name, config):
         print(config)
         self.base_init(base_name, config)
+        self.target_network_copy_freq = config.get('target_network_copy_freq', 4)
+        self.goal_achievement_epsilon = config.get('goal_achievement_epsilon', 0.0)
 
-        self.critic_learning_rate = config['critic_learning_rate']
-        self.actor_learning_rate = config['actor_learning_rate']
+        self.random_exploration_eps = config.get('random_exploration_eps', 15)
+        self.goal_directed_eps = config.get('goal_directed_eps', 100000)
+        self.max_ep_len = config.get('max_ep_len', 500)
+
+        self.batch_size = config.get('batch_size', 256)
+        self.learning_rate = config.get('learning_rate', 1e-3)
+        self.critic_learning_rate = config.get('critic_learning_rate', 1e-4)
+        self.actor_learning_rate = config.get('actor_learning_rate', 1e-4)
+
+        self.train_steps_per_ep = config.get('train_steps_per_ep', 80)
+        self.eval_freq = config.get('eval_freq', 1)
+        self.num_eval_goals = config.get('num_eval_goals', 1)
+        self.policy_freq = config.get('policy_freq', 2)
+        
+        self.noise_eps = config.get('noise_eps', 0.3)
+        self.exploration_epsilon = config.get('exploration_epsilon', 0.3)
+        self.horizon_sampling_const = config.get('horizon_sampling_const', 2.3)
+        
+        self.use_LR_scheduler = config.get('use_LR_scheduler', True)
+        self.LR_change_episode = config.get('LR_change_episode', 2000)
+        self.LR_reduce_factor = config.get('LR_reduce_factor', 10)
+        self.use_decaying_epsilon = config.get('use_decaying_epsilon', True)
+        self.epsilon_decay_denominator = config.get('epsilon-decay-denominator', 150)
+
+        self.use_HER = config.get('use_HER', True)
+        self.HER_fraction = config.get('HER_fraction', 0.8)
+        self.c_clipping = config.get('c_clipping', False)
+
+        
         self.seed = config['overall_seed']
         
         self.random_exploration_eps = config['random_exploration_eps']
@@ -182,13 +211,7 @@ class ClearningAgent:
         # self.ppo = config['ppo']
         self.max_epochs = self.config.get('max_epochs', 1e6)
         self.network = config['network']
-        self.rewards_shaper = config['reward_shaper']
         self.num_agents = self.env_info.get('agents', 1)
-        self.steps_num = config['steps_num']
-        self.seq_len = self.config.get('seq_length', 4)
-        # self.normalize_advantage = config['normalize_advantage']
-        self.normalize_input = self.config['normalize_input']
-        # self.normalize_reward = self.config.get('normalize_reward', False)
 
         self.obs_shape = self.observation_space.shape
 
@@ -232,28 +255,6 @@ class ClearningAgent:
         self.current_rewards = torch.zeros(batch_size, dtype=torch.float32, device=self.device)
         self.current_lengths = torch.zeros(batch_size, dtype=torch.float32, device=self.device)
         self.dones = torch.zeros((batch_size,), dtype=torch.uint8, device=self.device)
-        self.mb_obs = torch.zeros((self.steps_num, batch_size) + self.obs_shape, dtype=torch_dtype, device=self.device)
-
-        if self.has_central_value:
-            self.mb_vobs = torch.zeros((self.steps_num, self.num_actors) + self.state_shape, dtype=torch_dtype, device=self.device)
-
-        self.mb_rewards = torch.zeros((self.steps_num, batch_size), dtype = torch.float32, device=self.device)
-        self.mb_values = torch.zeros((self.steps_num, batch_size), dtype = torch.float32, device=self.device)
-        self.mb_dones = torch.zeros((self.steps_num, batch_size), dtype = torch.uint8, device=self.device)
-        self.mb_neglogpacs = torch.zeros((self.steps_num, batch_size), dtype = torch.float32, device=self.device)
-
-        if self.is_rnn:
-            self.rnn_states = self.model.get_default_rnn_state()
-            self.rnn_states = [s.to(self.device) for s in self.rnn_states]
-
-            batch_size = self.num_agents * self.num_actors
-            num_seqs = self.steps_num * batch_size // self.seq_len
-            assert((self.steps_num * batch_size // self.num_minibatches) % self.seq_len == 0)
-            self.mb_rnn_states = [torch.zeros((s.size()[0], num_seqs, s.size()[2]), dtype = torch.float32, device=self.device) for s in self.rnn_states]
-
-    @property
-    def alpha(self):
-        return self.log_alpha.exp()
 
     
     def get_full_state_weights(self):
@@ -340,7 +341,7 @@ class ClearningAgent:
         for i in range(ep_steps):
             input.append(np.array(episode[i]["observation"].copy()).squeeze())
 
-        input = preproc_og(np.array(input))
+        input = self.preproc_og(np.array(input))
         o_norm.update(input)
         o_norm.recompute_stats()
 
@@ -350,35 +351,46 @@ class ClearningAgent:
         for _ in range(10000):
             obs = env.reset()
             generated_goals.append(obs['desired_goal'].copy())
-        generated_goals_clip = preproc_og(np.array(generated_goals))
+        generated_goals_clip = self.preproc_og(np.array(generated_goals))
         g_norm.update(generated_goals_clip)
         g_norm.recompute_stats()
         
     def run_episode(self, action_policy, ep_length):
         observation = self.vec_env.reset() # TODO
         ep_history = []
-        success = 0
+        success = np.zeros(observation.shape[0])
         for _ in range(ep_length):
             selected_actions = torch.empty(self.num_actors, *self.env_info["action_space"].shape).to(self.device)
             for i in range(self.num_actors):
-                selected_actions[i]  = action_policy(observation['observation'], observation['desired_goal'])
+                desired_goal = observation[i][31:38]
+                selected_actions[i]  = action_policy(observation['observation'], desired_goal)
             new_observation, reward, done, _ = self.vec_env.step(selected_actions) # TODO
             # Store transition in episode buffer
             # Extend it out 
             # Maybe make ep_history another (num_actors, *everything else) array
             for i in range(self.num_actors):
-                ep_history.append({"observation": observation[i]['observation'].copy(),
-                                "action": selected_actions[i].copy(),
-                                "observation_next": new_observation[i]['observation'].copy(),
-                                "achieved_goal": new_observation[i]['achieved_goal'].copy(),
-                                "desired_goal":new_observation[i]['desired_goal'].copy()})
+                if not success[i] == 1:
+                    achieved_goal = new_observation[i][24:31]
+                    desired_goal = new_observation[i][31:38]
+                    # ep_history.append({"observation": observation[i]['observation'].copy(),
+                    #                 "action": selected_actions[i].copy(),
+                    #                 "observation_next": new_observation[i]['observation'].copy(),
+                    #                 "achieved_goal": new_observation[i]['achieved_goal'].copy(),
+                    #                 "desired_goal":new_observation[i]['desired_goal'].copy()})
+                    ep_history.append({"observation": observation[i].copy(),
+                                    "action": selected_actions[i].copy(),
+                                    "observation_next": new_observation[i].copy(),
+                                    "achieved_goal": achieved_goal.copy(),
+                                    "desired_goal": desired_goal.copy()})
             observation = new_observation
             # TODO: figure out how this works
-            if reward > -0.5:
-                success = 1
-                break
-            if done:
-                break
+            # Might be best  to vectorize this, and when it is successful, just stop doing anything there
+            success[reward > -0.5] = 1
+            # if reward > -0.5:
+            #     success = 1
+            #     break
+            # if done:
+            #     break
 
         return np.array(ep_history), success
 
@@ -410,7 +422,7 @@ class ClearningAgent:
                 if eval:
                     action_noise = actions
                 else:
-                    n = noise_epsilon * np.random.randn(self.self.action_space[0])
+                    n = noise_epsilon * np.random.randn(self.action_space[0])
                     tiled_noise = np.tile(n, max_horizon).reshape((max_horizon, -1))
                     tiled_noise = torch.tensor(tiled_noise).float().to(self.device)
                     action_noise = actions + tiled_noise
@@ -477,7 +489,7 @@ class ClearningAgent:
 
         # sample minibatch
         states_sample, actions_sample, goals_sample, horizons_sample, s_prime_sample, goal_achieved_sample = \
-            sample_long_range_transitions(dataset, batch_size=self.batch_size, rng=self.batch_sampling_rng,
+            self.sample_long_range_transitions(dataset, batch_size=self.batch_size, rng=self.batch_sampling_rng,
                                           horizon_sampling_probs=horizon_sampling_probs, env =self.vec_env,
                                           her_fraction=self.HER_fraction, use_HER=self.use_HER)
 
@@ -520,11 +532,11 @@ class ClearningAgent:
         # when h=1 or s_prim =g we are having a different target.
         for i in range(len(horizons_sample)):
             # TODO: Environment compute reward
-            if self.env.compute_reward(goal_achieved_sample[i], goals_sample_unnormalized[i], None) > -0.5:
+            if self.vec_env.compute_reward(goal_achieved_sample[i], goals_sample_unnormalized[i], None) > -0.5:
                 accessibilities_rhs[i] = 1.0
 
             if horizons_sample[i] == 1:
-                if self.env.compute_reward(goal_achieved_sample[i], goals_sample_unnormalized[i], None) > -0.5:
+                if self.vec_env.compute_reward(goal_achieved_sample[i], goals_sample_unnormalized[i], None) > -0.5:
                     accessibilities_rhs[i] = 1.0
                 else:
                     accessibilities_rhs[i] = 0.0
