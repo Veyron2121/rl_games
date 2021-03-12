@@ -884,11 +884,39 @@ class CNetworkCont(NetworkBuilder):
 
     def forward(self, x):
         return self.net(x)
+
+class ActorNetwork(nn.Module):
+    def __init__(self, output_dim, **mlp_args):
+        super(ActorNetwork, self).__init__()
+
+        self.net = self._build_mlp(**mlp_args)
+        last_layer = list(self.net.children())[-2].out_features
+        self.net = nn.Sequential(*list(self.net.children()),
+                                    nn.Linear(last_layer, output_dim), 
+                                    self.activations_factory.create('tanh'))
+
+
+    def forward(self, x):
+        return self.net(x)
     
+
+class CLearningTD3Builder(NetworkBuilder):
+
+    def __init__(self, **kwargs):
+        NetworkBuilder.__init__(self)
+
+    def load(self, params):
+        self.params = params
+    
+    def build(self, name, **kwargs):
+        net = CLearningTD3Builder.Network(self.params, **kwargs)
+        return net
+
     class Network(NetworkBuilder.BaseNetwork):
         def __init__(self, params, **kwargs):
             actions_num = kwargs.pop('actions_num')
             input_shape = kwargs.pop('input_shape')
+            goal_dim = kwargs.pop('goal_dim')
             #TODO: get Obs dim
             obs_dim = kwargs.pop('obs_dim')
             action_dim = kwargs.pop('action_dim')
