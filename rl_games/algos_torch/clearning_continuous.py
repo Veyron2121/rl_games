@@ -19,6 +19,8 @@ import torch.nn.functional as F
 import numpy as np
 import time
 # TODO: Change all self.env to self.vec_env
+from typing import List
+import threading 
 
 class normalizer:
     def __init__(self, size, eps=1e-2, default_clip_range=np.inf):
@@ -101,8 +103,8 @@ class ClearningAgent:
 
         self.batch_size = config.get('batch_size', 256)
         self.learning_rate = config.get('learning_rate', 1e-3)
-        self.critic_learning_rate = config.get('critic_learning_rate', 1e-4)
-        self.actor_learning_rate = config.get('actor_learning_rate', 1e-4)
+        self.learning_rate_critic = config.get('critic_learning_rate', 1e-4)
+        self.learning_rate_actor = config.get('actor_learning_rate', 1e-4)
 
         self.train_steps_per_ep = config.get('train_steps_per_ep', 80)
         self.eval_freq = config.get('eval_freq', 1)
@@ -117,19 +119,19 @@ class ClearningAgent:
         self.LR_change_episode = config.get('LR_change_episode', 2000)
         self.LR_reduce_factor = config.get('LR_reduce_factor', 10)
         self.use_decaying_epsilon = config.get('use_decaying_epsilon', True)
-        self.epsilon_decay_denominator = config.get('epsilon-decay-denominator', 150)
+        self.epsilon_decay_denominator = config.get('epsilon_decay_denominator', 150)
 
         self.use_HER = config.get('use_HER', True)
         self.HER_fraction = config.get('HER_fraction', 0.8)
         self.c_clipping = config.get('c_clipping', False)
 
         
-        self.seed = config['overall_seed']
+        self.seed = config.get('overall_seed', 7)
         
         self.random_exploration_eps = config['random_exploration_eps']
         self.max_ep_len = config['max_ep_len']
         self.goal_directed_eps = config['goal_directed_eps']
-        self.exploration_epsilon = config['exploration_eps']
+        self.exploration_epsilon = config['exploration_epsilon']
         self.noise_epsilon = config['noise_eps']
 
         self.eval_freq = config['eval_freq']
@@ -154,7 +156,8 @@ class ClearningAgent:
             'obs_dim': self.env_info["observation_space"].shape[0],
             'action_dim': self.env_info["action_space"].shape[0],
             'actions_num' : self.actions_num,
-            'input_shape' : obs_shape
+            'input_shape' : obs_shape,
+            'goal_dim': 4
             # 'num_seqs' : self.num_actors * self.num_agents
         } 
         self.model = self.network.build(config)
@@ -167,7 +170,7 @@ class ClearningAgent:
         self.optimizer_actor = torch.optim.Adam(self.model.clearning_network.actor.parameters(), lr=self.learning_rate_actor)
 
         self.o_norm = normalizer(size=self.env_info["observation_space"].shape[0], default_clip_range=5) # TODO
-        self.g_norm = normalizer(size=env.d_goal, default_clip_range=5) # TODO
+        self.g_norm = normalizer(size=4, default_clip_range=5) # TODO
         # TODO: Algo_Observer?
         self.dataset = []
         self.eval_goal_list = []
@@ -220,14 +223,6 @@ class ClearningAgent:
         self.game_rewards = torch_ext.AverageMeter(1, self.games_to_track).to(self.device)
         self.game_lengths = torch_ext.AverageMeter(1, self.games_to_track).to(self.device)
         self.obs = None
-        self.games_num = self.config['minibatch_size'] // self.seq_len # it is used only for current rnn implementation
-        self.batch_size = self.steps_num * self.num_actors * self.num_agents
-        print(self.batch_size, self.steps_num, self.num_actors, self.num_agents)
-        self.batch_size_envs = self.steps_num * self.num_actors
-        self.minibatch_size = self.config['minibatch_size']
-        self.mini_epochs_num = self.config['mini_epochs']
-        self.num_minibatches = self.batch_size // self.minibatch_size
-        assert(self.batch_size % self.minibatch_size == 0)
 
         # self.last_lr = self.config['learning_rate']
         self.frame = 0
@@ -358,30 +353,33 @@ class ClearningAgent:
     def run_episode(self, action_policy, ep_length):
         observation = self.vec_env.reset() # TODO
         ep_history = []
-        success = np.zeros(observation.shape[0])
+        success = torch.zeros(observation.shape[0], device=self.device)
         for _ in range(ep_length):
             selected_actions = torch.empty(self.num_actors, *self.env_info["action_space"].shape).to(self.device)
             for i in range(self.num_actors):
-                desired_goal = observation[i][31:38]
-                selected_actions[i]  = action_policy(observation['observation'], desired_goal)
+                desired_goal_pose = observation[i][31:38]
+                desired_goal = desired_goal_pose[3:7]
+                selected_actions[i]  = torch.from_numpy(action_policy(observation[i], desired_goal)).to(self.device)
             new_observation, reward, done, _ = self.vec_env.step(selected_actions) # TODO
             # Store transition in episode buffer
             # Extend it out 
             # Maybe make ep_history another (num_actors, *everything else) array
             for i in range(self.num_actors):
                 if not success[i] == 1:
-                    achieved_goal = new_observation[i][24:31]
-                    desired_goal = new_observation[i][31:38]
+                    achieved_goal_pose = new_observation[i][24:31]
+                    desired_goal_pose = new_observation[i][31:38]
+                    achieved_goal = achieved_goal_pose[3:7]
+                    desired_goal = desired_goal_pose[3:7]
                     # ep_history.append({"observation": observation[i]['observation'].copy(),
                     #                 "action": selected_actions[i].copy(),
-                    #                 "observation_next": new_observation[i]['observation'].copy(),
+                    #                 "observat ion_next": new_observation[i]['observation'].copy(),
                     #                 "achieved_goal": new_observation[i]['achieved_goal'].copy(),
                     #                 "desired_goal":new_observation[i]['desired_goal'].copy()})
-                    ep_history.append({"observation": observation[i].copy(),
-                                    "action": selected_actions[i].copy(),
-                                    "observation_next": new_observation[i].copy(),
-                                    "achieved_goal": achieved_goal.copy(),
-                                    "desired_goal": desired_goal.copy()})
+                    ep_history.append({"observation": observation[i].clone(),
+                                    "action": selected_actions[i].clone(),
+                                    "observation_next": new_observation[i].clone(),
+                                    "achieved_goal": achieved_goal.clone(),
+                                    "desired_goal": desired_goal.clone()})
             observation = new_observation
             # TODO: figure out how this works
             # Might be best  to vectorize this, and when it is successful, just stop doing anything there
@@ -392,7 +390,7 @@ class ClearningAgent:
             # if done:
             #     break
 
-        return np.array(ep_history), success
+        return np.array(ep_history), success.cpu().detach().numpy()
 
     def goal_conditioned_c_learning_policy(self, rng, exploration_epsilon=0.2, eval=False,
                                            horizon=None, noise_epsilon=0.2, g_norm=None, o_norm=None):
@@ -571,12 +569,15 @@ class ClearningAgent:
     
 
     def train(self):
-        start_time_s = time()
+        # start_time_s = time()
+        total_steps_taken = 0
+        dataset = []
         self.init_tensors()
         def random_exploration_policy(states, goal):
             return np.random.uniform(low=self.action_range[0], high=self.action_range[1], size=self.env_info["action_space"].shape)
-
+        print("Random Exploration")
         for _ in range(self.random_exploration_eps):
+            print("Hello")
             ep_history, ep_success = self.run_episode(action_policy=random_exploration_policy,
                                             ep_length=self.max_ep_len)
             total_steps_taken += len(ep_history)
@@ -585,9 +586,10 @@ class ClearningAgent:
             if len(ep_history) > 1:
                 dataset.append(ep_history)
 
-        gde_start_time_s = time()
-
+        # gde_start_time_s = time()
+        print("Goal Directed Episodes")
         for gde_ep in range(self.goal_directed_eps):
+            print(gde_ep)
 
             policy = self.goal_conditioned_c_learning_policy(rng=self.exploration_rng,
                                                         eval=False, exploration_epsilon=self.exploration_epsilon,
@@ -628,14 +630,14 @@ class ClearningAgent:
                     eval_goal_step.append(len(ep_history))
                     eval_goal_success.append(ep_success)
 
-                gde_elapsed_time_s = time() - gde_start_time_s
+                # gde_elapsed_time_s = time() - gde_start_time_s
                 gde_mean_ep_time = gde_elapsed_time_s / (
                             (gde_ep + 1) + (gde_ep // self.eval_freq + 1) * (1 + self.num_eval_goals))
 
                 # print and save the result for the eval
                 print(
                     f'Mean success rate to goal: {np.mean(eval_goal_success):.2f}\tMean step to goal: {np.mean(eval_goal_step):.1f} ' +
-                    f' [episode {gde_ep} / {self.goal_directed_eps}, {gde_mean_ep_time:.2f} s per episode]')
+                    f' [episode {gde_ep} / {self.goal_directed_eps}, {0} s per episode]')
 
                 eval_goal_list.append(np.array(goal_list))
                 eval_mean_success.append(np.mean(eval_goal_success))
@@ -648,8 +650,8 @@ class ClearningAgent:
                 batch_size = self.batch_size
                 self.learn(gde_ep, dataset, batch_size=batch_size, batch_sampling_rng=self.batch_sampling_rng, o_norm=self.o_norm, g_norm=self.g_norm)
 
-        elapsed_time_s = time() - start_time_s
-        print('Training took {:.0f} seconds.'.format(elapsed_time_s))
+        # elapsed_time_s = time() - start_time_s
+        # print('Training took {:.0f} seconds.'.format(elapsed_time_s))
 
 
         
