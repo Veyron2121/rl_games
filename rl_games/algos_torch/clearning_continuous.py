@@ -20,7 +20,8 @@ import numpy as np
 import time
 # TODO: Change all self.env to self.vec_env
 from typing import List
-import threading 
+# import threading 
+# from mpi4py import MPI
 
 class normalizer:
     def __init__(self, size, eps=1e-2, default_clip_range=np.inf):
@@ -39,16 +40,16 @@ class normalizer:
         self.mean = np.zeros(self.size, np.float32)
         self.std = np.ones(self.size, np.float32)
         # thread locker
-        self.lock = threading.Lock()
+        # self.lock = threading.Lock()
 
     # update the parameters of the normalizer
     def update(self, v):
         v = v.reshape(-1, self.size)
         # do the computing
-        with self.lock:
-            self.local_sum += v.sum(axis=0)
-            self.local_sumsq += (np.square(v)).sum(axis=0)
-            self.local_count[0] += v.shape[0]
+        # with self.lock:
+        self.local_sum += v.sum(axis=0)
+        self.local_sumsq += (np.square(v)).sum(axis=0)
+        self.local_count[0] += v.shape[0]
 
     # sync the parameters across the cpus
     def sync(self, local_sum, local_sumsq, local_count):
@@ -58,16 +59,17 @@ class normalizer:
         return local_sum, local_sumsq, local_count
 
     def recompute_stats(self):
-        with self.lock:
-            local_count = self.local_count.copy()
-            local_sum = self.local_sum.copy()
-            local_sumsq = self.local_sumsq.copy()
-            # reset
-            self.local_count[...] = 0
-            self.local_sum[...] = 0
-            self.local_sumsq[...] = 0
+        # with self.lock:
+        local_count = self.local_count.copy()
+        local_sum = self.local_sum.copy()
+        local_sumsq = self.local_sumsq.copy()
+        # reset
+        self.local_count[...] = 0
+        self.local_sum[...] = 0
+        self.local_sumsq[...] = 0
         # synrc the stats
-        sync_sum, sync_sumsq, sync_count = self.sync(local_sum, local_sumsq, local_count)
+        # sync_sum, sync_sumsq, sync_count = self.sync(local_sum, local_sumsq, local_count)
+        sync_sum, sync_sumsq, sync_count = local_sum, local_sumsq, local_count
         # update the total stuff
         self.total_sum += sync_sum
         self.total_sumsq += sync_sumsq
@@ -86,6 +88,7 @@ class normalizer:
 
     # normalize the observation
     def normalize(self, v, clip_range=None):
+        # print(v.shape)
         if clip_range is None:
             clip_range = self.default_clip_range
         return np.clip((v - self.mean) / (self.std), -clip_range, clip_range)
@@ -168,8 +171,8 @@ class ClearningAgent:
         self.optimizer_critic1 = torch.optim.Adam(self.model.clearning_network.critic1.parameters(), lr=self.learning_rate_critic)
         self.optimizer_critic2 = torch.optim.Adam(self.model.clearning_network.critic2.parameters(), lr=self.learning_rate_critic)
         self.optimizer_actor = torch.optim.Adam(self.model.clearning_network.actor.parameters(), lr=self.learning_rate_actor)
-
-        self.o_norm = normalizer(size=self.env_info["observation_space"].shape[0], default_clip_range=5) # TODO
+        print(self.observation_space)
+        self.o_norm = normalizer(size=self.observation_space.shape[0], default_clip_range=5) # TODO
         self.g_norm = normalizer(size=4, default_clip_range=5) # TODO
         # TODO: Algo_Observer?
         self.dataset = []
@@ -274,10 +277,6 @@ class ClearningAgent:
          'critic2': self.model.clearning_network.critic2.state_dict(), 
          'target_critic2': self.model.clearning_network.target_critic2.state_dict()}
 
-        if self.normalize_input:
-            state['running_mean_std'] = self.running_mean_std.state_dict()
-        # if self.normalize_reward:
-        #     state['reward_mean_std'] = self.reward_mean_std.state_dict()   
         return state
 
            
@@ -326,7 +325,7 @@ class ClearningAgent:
 
 
     def preproc_og(self, o):
-        o = np.clip(o, -200, 200)
+        # o = np.clip(o, -200, 200)
         return o
 
     # update parameters in the o_norm normalizer
@@ -334,7 +333,7 @@ class ClearningAgent:
         input = []
         ep_steps = len(episode)
         for i in range(ep_steps):
-            input.append(np.array(episode[i]["observation"].copy()).squeeze())
+            input.append(np.array(episode[i]['observation'].cpu().detach().numpy().copy()).squeeze())
 
         input = self.preproc_og(np.array(input))
         o_norm.update(input)
@@ -345,50 +344,42 @@ class ClearningAgent:
         generated_goals = []
         for _ in range(10000):
             obs = env.reset()
-            generated_goals.append(obs['desired_goal'].copy())
+            desired_goal_pose = obs[31:38]
+            desired_goal = desired_goal_pose[3:7]
+            generated_goals.append(desired_goal.cpu().detach().numpy().copy())
         generated_goals_clip = self.preproc_og(np.array(generated_goals))
         g_norm.update(generated_goals_clip)
         g_norm.recompute_stats()
         
     def run_episode(self, action_policy, ep_length):
         observation = self.vec_env.reset() # TODO
-        ep_history = []
+        ep_history = [[]] * self.num_actors
         success = torch.zeros(observation.shape[0], device=self.device)
         for _ in range(ep_length):
             selected_actions = torch.empty(self.num_actors, *self.env_info["action_space"].shape).to(self.device)
             for i in range(self.num_actors):
                 desired_goal_pose = observation[i][31:38]
                 desired_goal = desired_goal_pose[3:7]
-                selected_actions[i]  = torch.from_numpy(action_policy(observation[i], desired_goal)).to(self.device)
+                selected_actions[i]  = torch.from_numpy(action_policy(observation[i].cpu().detach().numpy(), desired_goal.cpu().detach().numpy())).to(self.device)
             new_observation, reward, done, _ = self.vec_env.step(selected_actions) # TODO
+
+
             # Store transition in episode buffer
             # Extend it out 
             # Maybe make ep_history another (num_actors, *everything else) array
             for i in range(self.num_actors):
-                if not success[i] == 1:
+                if not (success[i] == 1 or done[i] == True):
                     achieved_goal_pose = new_observation[i][24:31]
                     desired_goal_pose = new_observation[i][31:38]
                     achieved_goal = achieved_goal_pose[3:7]
                     desired_goal = desired_goal_pose[3:7]
-                    # ep_history.append({"observation": observation[i]['observation'].copy(),
-                    #                 "action": selected_actions[i].copy(),
-                    #                 "observat ion_next": new_observation[i]['observation'].copy(),
-                    #                 "achieved_goal": new_observation[i]['achieved_goal'].copy(),
-                    #                 "desired_goal":new_observation[i]['desired_goal'].copy()})
-                    ep_history.append({"observation": observation[i].clone(),
-                                    "action": selected_actions[i].clone(),
-                                    "observation_next": new_observation[i].clone(),
-                                    "achieved_goal": achieved_goal.clone(),
-                                    "desired_goal": desired_goal.clone()})
+                    ep_history[i].append({"observation": observation[i].clone().detach().cpu().numpy(),
+                                    "action": selected_actions[i].clone().detach().cpu().numpy(),
+                                    "observation_next": new_observation[i].clone().detach().cpu().numpy(),
+                                    "achieved_goal": achieved_goal.clone().detach().cpu().numpy(),
+                                    "desired_goal": desired_goal.clone().detach().cpu().numpy()})
             observation = new_observation
-            # TODO: figure out how this works
-            # Might be best  to vectorize this, and when it is successful, just stop doing anything there
             success[reward > -0.5] = 1
-            # if reward > -0.5:
-            #     success = 1
-            #     break
-            # if done:
-            #     break
 
         return np.array(ep_history), success.cpu().detach().numpy()
 
@@ -400,8 +391,8 @@ class ClearningAgent:
 
         def policy(state, goal):
 
-            state = o_norm.normalize(state)
-            goal = g_norm.normalize(goal)
+            # state = o_norm.normalize(state)
+            # goal = g_norm.normalize(goal)
 
             tiled_state = np.tile(state, max_horizon).reshape((max_horizon, -1))
             tiled_goal = np.tile(goal, reps=max_horizon).reshape((max_horizon, -1))
@@ -414,13 +405,13 @@ class ClearningAgent:
             exploration_p = rng.uniform(low=0.0, high=1.0)
 
             if exploration_p < exploration_epsilon and not eval:
-                a = rng.uniform(-1, 1, size=self.action_space[0])
+                a = rng.uniform(-1, 1, size=self.action_space.shape[0])
             else:
                 actions = self.model.actor(x_action)
                 if eval:
                     action_noise = actions
                 else:
-                    n = noise_epsilon * np.random.randn(self.action_space[0])
+                    n = noise_epsilon * np.random.randn(self.action_space.shape[0])
                     tiled_noise = np.tile(n, max_horizon).reshape((max_horizon, -1))
                     tiled_noise = torch.tensor(tiled_noise).float().to(self.device)
                     action_noise = actions + tiled_noise
@@ -446,10 +437,13 @@ class ClearningAgent:
 
         ep_idx_sample = rng.choice(len(dataset), size=batch_size, replace=True, p=prob / np.sum(prob))
         ep_sample = [dataset[idx] for idx in ep_idx_sample]
+        # print(ep_sample[0])
 
         start_idx_sample = [
             rng.choice(len(ep)) for ep
             in ep_sample]
+
+        # print(start_idx_sample)
 
         if horizon_sampling_probs is None:
             h_sample = np.array([rng.choice(len(ep) - start_idx) + 1 for ep, start_idx in zip(ep_sample, start_idx_sample)])
@@ -458,27 +452,38 @@ class ClearningAgent:
             max_h = len(horizon_sampling_probs)
             h_sample = np.array([rng.choice(max_h, p=horizon_sampling_probs / horizon_sampling_probs.sum(), size=batch_size)+ 1])
 
-        states_sample = np.array([ep[start_idx]["observation"] for ep, start_idx in zip(ep_sample, start_idx_sample)])
-        actions_sample = np.array([ep[start_idx]["action"] for ep, start_idx in zip(ep_sample, start_idx_sample)])
-        states_prime_sample = np.array([ep[start_idx]["observation_next"] for ep, start_idx in zip(ep_sample, start_idx_sample)])
-        goals_achieved_sample = np.array([ep[start_idx]["achieved_goal"] for ep, start_idx in zip(ep_sample, start_idx_sample)])
 
-        if use_HER:
-            goals_achieved_idx_sample = [rng.choice(range(start, len(ep))) for ep, start in zip(ep_sample, start_idx_sample)]
-            goals_achieved = np.array([ep[end_idx]["achieved_goal"] for ep, end_idx in zip(ep_sample, goals_achieved_idx_sample)])
-            goals_desired = np.array([ep[0]["desired_goal"] for ep in ep_sample])
+        states_sample = np.empty((batch_size, self.observation_space.shape[0]))
+        actions_sample = np.empty((batch_size, self.action_space.shape[0]))
+        states_prime_sample = np.empty((batch_size, self.observation_space.shape[0]))
+        goals_achieved_sample = np.empty((batch_size, 4))
+        h_sample = np.empty((batch_size, 1))
+        goals_sample = np.empty((batch_size, 4))
 
-            s = rng.choice([0, 1], p=[her_fraction, 1 - her_fraction], size=batch_size)
-            goals_sample = np.array([g1 if s1 == 0 else g2 for g1, g2, s1 in zip(goals_achieved, goals_desired, s)])
-        else:
-            end_idx_sample = []
-            for i in range(batch_size):
+        i = 0
+        # print(len(ep_sample), len(start_idx_sample))
+        for ep, start_idx in zip(ep_sample, start_idx_sample):
+            # print(i)
+            states_sample[i] = np.array(ep[start_idx]["observation"])
+            actions_sample[i] = np.array(ep[start_idx]["action"])
+            states_prime_sample[i] = np.array(ep[start_idx]["observation_next"])
+            goals_achieved_sample[i] = np.array(ep[start_idx]["achieved_goal"])
+            if use_HER:
+                goal_achieved_idx_sample = rng.choice(range(start_idx, len(ep)))
+                goal_achieved = np.array(ep[goal_achieved_idx_sample]["achieved_goal"])
+                goal_desired = np.array(ep[0]["desired_goal"])
+                # print(goal_achieved.shape)
+                # print(goal_desired.shape)
+
+                s = rng.choice([0, 1], p=[her_fraction, 1 - her_fraction])
+                goals_sample[i] = np.array(goal_achieved if s == 0 else goal_desired)
+            else:
                 end_s = env.sample_goal_from_state(states_sample[i,:], h_sample[0][i], rng)
-                end_idx_sample.append(end_s)
+                goals_sample[i] = np.array(end_s)
+            i += 1
+        return torch.from_numpy(states_sample).to(self.device), torch.from_numpy(actions_sample).to(self.device), torch.from_numpy(goals_sample).to(self.device), torch.from_numpy(h_sample).to(self.device), torch.from_numpy(states_prime_sample).to(self.device), torch.from_numpy(goals_achieved_sample).to(self.device)
 
-            goals_sample = np.array(end_idx_sample)
 
-        return states_sample, actions_sample, goals_sample, h_sample, states_prime_sample, goals_achieved_sample
     
     def learn(self, gde_ep, dataset, batch_size, batch_sampling_rng, o_norm, g_norm):
         # Sample shorter transitions towards the start of training and high transition towards the end
@@ -495,15 +500,18 @@ class ClearningAgent:
             self.model.clearning_network.update_targets()
 
         # save the unnormalized goals
-        goals_sample_unnormalized = goals_sample.copy()
+        goals_sample_unnormalized = goals_sample.clone()
+
+        # print(states_sample)
+        # print(states_sample.shape)
 
         # normalize data
         states_sample = self.preproc_og(states_sample)
         goals_sample = self.preproc_og(goals_sample)
         s_prime_sample = self.preproc_og(s_prime_sample)
-        states_sample = self.o_norm.normalize(states_sample)
-        goals_sample = self.g_norm.normalize(goals_sample)
-        s_prime_sample = self.o_norm.normalize(s_prime_sample)
+        # states_sample = self.o_norm.normalize(states_sample)
+        # goals_sample = self.g_norm.normalize(goals_sample)
+        # s_prime_sample = self.o_norm.normalize(s_prime_sample)
 
         # critic loss
         horizons_sample = horizons_sample.reshape((-1, 1))
@@ -518,7 +526,7 @@ class ClearningAgent:
             x_rhs = torch.cat((torch.tensor(s_prime_sample).float(), torch.tensor(goals_sample).float(),
                                torch.tensor(horizons_sample - 1).float()),
                               dim=1).to(self.device)
-            action_target = self.model.target_actor(x_rhs).detach().cpu()
+            action_target = self.model.target_actor(x_rhs)#.detach().cpu()
 
             x_rhs2 = torch.cat((torch.tensor(s_prime_sample).float(), torch.tensor(goals_sample).float(),
                                 torch.tensor(horizons_sample - 1).float(), action_target.float()),
@@ -529,12 +537,11 @@ class ClearningAgent:
 
         # when h=1 or s_prim =g we are having a different target.
         for i in range(len(horizons_sample)):
-            # TODO: Environment compute reward
-            if self.vec_env.compute_reward(goal_achieved_sample[i], goals_sample_unnormalized[i], None) > -0.5:
+            if self.vec_env.compute_reward(torch.unsqueeze(goal_achieved_sample[i], 0), torch.unsqueeze(goals_sample_unnormalized[i], 0)) > -0.5:
                 accessibilities_rhs[i] = 1.0
 
             if horizons_sample[i] == 1:
-                if self.vec_env.compute_reward(goal_achieved_sample[i], goals_sample_unnormalized[i], None) > -0.5:
+                if self.vec_env.compute_reward(goal_achieved_sample[i], goals_sample_unnormalized[i]) > -0.5:
                     accessibilities_rhs[i] = 1.0
                 else:
                     accessibilities_rhs[i] = 0.0
@@ -542,11 +549,13 @@ class ClearningAgent:
         self.optimizer_critic1.zero_grad()
         loss_this_batch1 = self.training_loss(accessibilities_lhs1, accessibilities_rhs)
         loss_this_batch1.backward()
+        self.writer.add_scalar('losses/critic1_loss', loss_this_batch1)
         self.optimizer_critic1.step()
 
         self.optimizer_critic2.zero_grad()
         loss_this_batch2 = self.training_loss(accessibilities_lhs2, accessibilities_rhs)
         loss_this_batch2.backward()
+        self.writer.add_scalar('losses/critic1_loss', loss_this_batch1)
         self.optimizer_critic2.step()
 
         # actor_loss
@@ -554,12 +563,13 @@ class ClearningAgent:
             x_a = torch.cat((torch.tensor(states_sample).float(), torch.tensor(goals_sample).float(),
                              torch.tensor(horizons_sample).float()),
                             dim=1).to(self.device)
-            actions_actor = self.model.actor(x_a).cpu()
+            actions_actor = self.model.actor(x_a)#.cpu()
 
             x_a2 = torch.cat((torch.tensor(states_sample).float(), torch.tensor(goals_sample).float(),
                               torch.tensor(horizons_sample).float(), actions_actor.float()),
                              dim=1).to(self.device)
             loss = -torch.mean(self.model.critic1(x_a2))
+            self.writer.add_scalar('losses/actor_loss', loss)
 
             self.optimizer_actor.zero_grad()
             loss.backward()
@@ -577,14 +587,14 @@ class ClearningAgent:
             return np.random.uniform(low=self.action_range[0], high=self.action_range[1], size=self.env_info["action_space"].shape)
         print("Random Exploration")
         for _ in range(self.random_exploration_eps):
-            print("Hello")
+            # print("Hello")
             ep_history, ep_success = self.run_episode(action_policy=random_exploration_policy,
                                             ep_length=self.max_ep_len)
-            total_steps_taken += len(ep_history)
+            self.total_steps_taken += len(ep_history)
 
             # add episode to the dataset when the length is larger than 1
             if len(ep_history) > 1:
-                dataset.append(ep_history)
+                dataset.extend(ep_history)
 
         # gde_start_time_s = time()
         print("Goal Directed Episodes")
@@ -599,17 +609,17 @@ class ClearningAgent:
                                                 ep_length=self.max_ep_len)
 
             # update statistics for o norm using the collected episode
-            update_o_norm(o_norm=self.o_norm, episode=ep_history)
+            # self.update_o_norm(o_norm=self.o_norm, episode=ep_history)
 
             # add episode to the dataset when the length is larger than 1
 
             # TODO: Redundant. Is appending needed, or extending? Maybe I should keep a vector of stuff and unflatten it here
             if len(ep_history) > 1:
-                dataset.append(ep_history)
+                dataset.extend(ep_history)
 
             # calc total steps taken
-            total_steps_taken += len(ep_history)
-            env_steps.append(total_steps_taken)
+            self.total_steps_taken += len(ep_history) # TODO: make this 2D
+            self.env_steps.append(self.total_steps_taken)
 
             # evaluation step
             if gde_ep % self.eval_freq == 0:
@@ -621,28 +631,28 @@ class ClearningAgent:
                     policy = self.goal_conditioned_c_learning_policy(rng=self.exploration_rng,
                                                                                         eval=True,
                                                                                         exploration_epsilon=self.exploration_epsilon,
-                                                                                        noise_epsilon=self.noise_epsislon,
+                                                                                        noise_epsilon=self.noise_epsilon,
                                                                                         g_norm=self.g_norm, o_norm=self.o_norm)
 
                     ep_history, ep_success = self.run_episode(action_policy=policy,
                                                                             ep_length=self.max_ep_len)
 
                     eval_goal_step.append(len(ep_history))
-                    eval_goal_success.append(ep_success)
+                    eval_goal_success.append(ep_success) # TODO: extend this. pls
 
                 # gde_elapsed_time_s = time() - gde_start_time_s
-                gde_mean_ep_time = gde_elapsed_time_s / (
-                            (gde_ep + 1) + (gde_ep // self.eval_freq + 1) * (1 + self.num_eval_goals))
+                # gde_mean_ep_time = gde_elapsed_time_s / (
+                #             (gde_ep + 1) + (gde_ep // self.eval_freq + 1) * (1 + self.num_eval_goals))
 
                 # print and save the result for the eval
                 print(
                     f'Mean success rate to goal: {np.mean(eval_goal_success):.2f}\tMean step to goal: {np.mean(eval_goal_step):.1f} ' +
                     f' [episode {gde_ep} / {self.goal_directed_eps}, {0} s per episode]')
 
-                eval_goal_list.append(np.array(goal_list))
-                eval_mean_success.append(np.mean(eval_goal_success))
-                eval_mean_step.append(np.mean(eval_goal_step))
-                eval_pts.append(gde_ep)
+                self.eval_goal_list.append(np.array(goal_list))
+                self.eval_mean_success.append(np.mean(eval_goal_success))
+                self.eval_mean_step.append(np.mean(eval_goal_step))
+                self.eval_pts.append(gde_ep)
 
             #train the models
             for _ in range(self.train_steps_per_ep):
