@@ -363,6 +363,18 @@ class ClearningAgent:
                 selected_actions[i]  = torch.from_numpy(action_policy(observation[i].cpu().detach().numpy(), desired_goal.cpu().detach().numpy())).to(self.device)
             new_observation, reward, done, _ = self.vec_env.step(selected_actions) # TODO
 
+            self.current_rewards += reward
+            self.current_lengths += 1
+            all_done_indices = dones.nonzero(as_tuple=False)
+            done_indices = all_done_indices[::self.num_agents]
+  
+            self.game_rewards.update(self.current_rewards[done_indices])
+            self.game_lengths.update(self.current_lengths[done_indices])
+
+            not_dones = 1.0 - dones.float()
+
+            self.current_rewards = self.current_rewards * not_dones
+            self.current_lengths = self.current_lengths * not_dones
 
             # Store transition in episode buffer
             # Extend it out 
